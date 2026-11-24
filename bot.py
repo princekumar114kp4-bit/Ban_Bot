@@ -472,7 +472,7 @@ except Exception:
 # ============================================================
 # ⚙️ CONFIGURATION - EDIT THESE VALUES
 # ============================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")       # Get from @BotFather
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8843120789:AAHaPPXXoqm9BrVRZ8heGRHpm-YYeRBYpZo")       # Get from @BotFather
 ADMIN_ID = 8597878282                    # Your Telegram ID (get from @userinfobot)
 BOT_USERNAME = "Ban Bot"        # Without @, e.g., "BotBanProBot"
 BANNED_BOT_IMAGE_URL = "https://i.ibb.co/wF29FM3W/3340.png"  # DP for banned bots
