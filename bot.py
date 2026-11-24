@@ -21,6 +21,7 @@ from telebot import TeleBot, types
 
 # >>> hyv-injected:backup (added by the implementer bot: owner/admin Export and Import of data files)
 import hashlib as _hyv_bk_hash
+import inspect as _hyv_bk_inspect
 import json as _hyv_bk_json
 import os as _hyv_bk_os
 import re as _hyv_bk_re
@@ -42,6 +43,9 @@ _HYV_BK_CODE_PATH = _hyv_bk_re.compile(r"""["']([^"'\s]+\.(?:db|sqlite3?|json|cs
 _HYV_BK_BTN_EXPORT = "📤 Export"
 _HYV_BK_BTN_IMPORT = "📥 Import"
 _HYV_BK_BTN_BACK = "🔙 Back"
+_HYV_BK_BTN_DB = "🗄 Database Export/Import"   # the button the admin taps to open the backup menu
+_HYV_BK_DB_LABELS = (_HYV_BK_BTN_DB, _HYV_BK_BTN_EXPORT, _HYV_BK_BTN_IMPORT)
+_HYV_BK_BTN_STYLE = "primary"   # colour of the Database button (blue), same as the bot's option buttons
 _hyv_bk_pending = {}   # admin user id -> "import" or staged restore info
 
 
@@ -195,7 +199,64 @@ def _hyv_bk_bar(done, total=5):
     return "▰" * done + "▱" * (total - done)
 
 
+def _hyv_bk_admin_chat(chat_id):
+    """True when the chat is the private chat of an admin (in a private chat chat_id is the user id)."""
+    return chat_id is not None and not isinstance(chat_id, bool) and _hyv_bk_is_admin(chat_id)
+
+
+def _hyv_bk_btn(label):
+    """The Database button as the dict telebot keeps in a keyboard row, with its colour (style). A telebot version
+    whose KeyboardButton does not take style gets the style added to the dict, so it still reaches Telegram."""
+    try:
+        return _hyv_bk_types.KeyboardButton(label, style=_HYV_BK_BTN_STYLE).to_dict()
+    except TypeError:
+        btn = _hyv_bk_types.KeyboardButton(label).to_dict()
+        btn["style"] = _HYV_BK_BTN_STYLE
+        return btn
+
+
+def _hyv_bk_tb_markup(markup):
+    """The same reply keyboard with the Database button in one extra last row. The original object is not changed."""
+    if not isinstance(markup, _hyv_bk_types.ReplyKeyboardMarkup):
+        return markup
+    rows = [list(row) for row in (markup.keyboard or [])]
+    texts = [b.get("text") if isinstance(b, dict) else getattr(b, "text", b) for row in rows for b in row]
+    if any(t in _HYV_BK_DB_LABELS for t in texts):
+        return markup
+    rows.append([_hyv_bk_btn(_HYV_BK_BTN_DB)])
+    return _hyv_bk_types.ReplyKeyboardMarkup(
+        resize_keyboard=markup.resize_keyboard, one_time_keyboard=markup.one_time_keyboard,
+        selective=markup.selective, row_width=markup.row_width,
+        input_field_placeholder=markup.input_field_placeholder, is_persistent=markup.is_persistent, keyboard=rows)
+
+
+def _hyv_bk_tb_wrap(fn, sig):
+    def send(*args, **kwargs):
+        try:
+            bound = sig.bind_partial(*args, **kwargs)
+        except TypeError:
+            return fn(*args, **kwargs)
+        if _hyv_bk_admin_chat(bound.arguments.get("chat_id")) and bound.arguments.get("reply_markup") is not None:
+            bound.arguments["reply_markup"] = _hyv_bk_tb_markup(bound.arguments["reply_markup"])
+        return fn(*bound.args, **bound.kwargs)
+    send.__name__ = fn.__name__
+    return send
+
+
+def _hyv_bk_patch_telebot(bot):
+    """pyTelegramBotAPI: the send_* methods of this bot object that take a reply keyboard add the Database row
+    when the chat is an admin's private chat."""
+    for name in dir(type(bot)):
+        fn = getattr(bot, name, None) if name.startswith("send_") else None
+        if fn is None or not callable(fn):
+            continue
+        sig = _hyv_bk_inspect.signature(fn)
+        if "reply_markup" in sig.parameters:
+            setattr(bot, name, _hyv_bk_tb_wrap(fn, sig))
+
+
 def _hyv_bk_register(bot):
+    _hyv_bk_patch_telebot(bot)
     def admin_private(m):
         return m.chat.type == "private" and _hyv_bk_is_admin(m.from_user.id)
 
@@ -319,7 +380,7 @@ def _hyv_bk_register(bot):
 
     before_m = len(bot.message_handlers)
     before_c = len(bot.callback_query_handlers)
-    bot.message_handler(func=lambda m: admin_private(m) and m.text in ("/backup", "/hyvbackup"))(show_menu)
+    bot.message_handler(func=lambda m: admin_private(m) and m.text in ("/backup", "/hyvbackup", _HYV_BK_BTN_DB))(show_menu)
     bot.message_handler(func=lambda m: admin_private(m) and m.text == _HYV_BK_BTN_EXPORT)(export)
     bot.message_handler(func=lambda m: admin_private(m) and m.text == _HYV_BK_BTN_IMPORT)(start_import)
     bot.message_handler(func=lambda m: admin_private(m) and m.text == _HYV_BK_BTN_BACK)(back)
@@ -411,7 +472,7 @@ except Exception:
 # ============================================================
 # ⚙️ CONFIGURATION - EDIT THESE VALUES
 # ============================================================
-BOT_TOKEN = "8843120789:AAHaPPXXoqm9BrVRZ8heGRHpm-YYeRBYpZo"       # Get from @BotFather
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")       # Get from @BotFather
 ADMIN_ID = 8597878282                    # Your Telegram ID (get from @userinfobot)
 BOT_USERNAME = "Ban Bot"        # Without @, e.g., "BotBanProBot"
 BANNED_BOT_IMAGE_URL = "https://i.ibb.co/wF29FM3W/3340.png"  # DP for banned bots
