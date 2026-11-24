@@ -19,6 +19,324 @@ from datetime import datetime
 from io import BytesIO
 from telebot import TeleBot, types
 
+# >>> hyv-injected:backup (added by the implementer bot: owner/admin Export and Import of data files)
+import hashlib as _hyv_bk_hash
+import json as _hyv_bk_json
+import os as _hyv_bk_os
+import re as _hyv_bk_re
+import shutil as _hyv_bk_shutil
+import sqlite3 as _hyv_bk_sqlite
+import tempfile as _hyv_bk_tmp
+import time as _hyv_bk_time
+import zipfile as _hyv_bk_zip
+from telebot import types as _hyv_bk_types
+
+_HYV_BK_HERE = _hyv_bk_os.path.dirname(_hyv_bk_os.path.abspath(__file__))
+_HYV_BK_SELF = _hyv_bk_os.path.basename(__file__)
+_HYV_BK_MAX = 50 * 1024 * 1024
+_HYV_BK_EXT = (".db", ".sqlite", ".sqlite3", ".json", ".csv", ".txt", ".pkl", ".pickle", ".dat", ".yaml", ".yml", ".xml")
+_HYV_BK_DB_EXT = (".db", ".sqlite", ".sqlite3")
+_HYV_BK_SKIP_DIRS = {"__pycache__", "venv", ".venv", "env", ".git", "node_modules"}
+_HYV_BK_SECRET = _hyv_bk_re.compile(r"(\.env|token|secret|passw|credential|api_?key|private)", _hyv_bk_re.I)
+_HYV_BK_CODE_PATH = _hyv_bk_re.compile(r"""["']([^"'\s]+\.(?:db|sqlite3?|json|csv|txt|pkl|pickle|dat|ya?ml|xml))["']""")
+_HYV_BK_BTN_EXPORT = "📤 Export"
+_HYV_BK_BTN_IMPORT = "📥 Import"
+_HYV_BK_BTN_BACK = "🔙 Back"
+_hyv_bk_pending = {}   # admin user id -> "import" or staged restore info
+
+
+_HYV_BK_ADMINS = {8597878282}   # Telegram id of the member who sent the bot file (set when added)
+
+
+def _hyv_bk_is_admin(uid):
+    ids = set(str(x) for x in _HYV_BK_ADMINS)
+    for raw in _hyv_bk_os.environ.get("HYV_ADMIN_IDS", "").split(","):
+        if raw.strip():
+            ids.add(raw.strip())
+    return str(uid) in ids
+
+
+def _hyv_bk_excluded(rel):
+    parts = rel.replace("\\", "/").split("/")
+    if any(p in _HYV_BK_SKIP_DIRS or p.startswith("hyv_safety") for p in parts[:-1]):
+        return True
+    name = parts[-1]
+    return (name == _HYV_BK_SELF or name.endswith((".zip", ".pyc")) or bool(_HYV_BK_SECRET.search(name)))
+
+
+def _hyv_bk_sha(path):
+    h = _hyv_bk_hash.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _hyv_bk_collect():
+    picked = {}
+    for root, dirs, files in _hyv_bk_os.walk(_HYV_BK_HERE):
+        dirs[:] = [d for d in dirs if d not in _HYV_BK_SKIP_DIRS and not d.startswith("hyv_safety")]
+        for f in files:
+            full = _hyv_bk_os.path.join(root, f)
+            rel = _hyv_bk_os.path.relpath(full, _HYV_BK_HERE).replace(_hyv_bk_os.sep, "/")
+            if not _hyv_bk_excluded(rel) and f.lower().endswith(_HYV_BK_EXT):
+                picked[rel] = full
+    try:
+        with open(__file__, "r", encoding="utf-8", errors="ignore") as fh:
+            code = fh.read()
+    except OSError:
+        code = ""
+    for m in _HYV_BK_CODE_PATH.finditer(code):
+        p = m.group(1)
+        if _hyv_bk_os.path.isabs(p):
+            continue
+        for base in (_HYV_BK_HERE, _hyv_bk_os.getcwd()):
+            full = _hyv_bk_os.path.normpath(_hyv_bk_os.path.join(base, p))
+            rel = _hyv_bk_os.path.relpath(full, _HYV_BK_HERE).replace(_hyv_bk_os.sep, "/")
+            if (_hyv_bk_os.path.isfile(full) and not rel.startswith("..") and not _hyv_bk_excluded(rel)):
+                picked[rel] = full
+    return picked
+
+
+def _hyv_bk_make_zip(picked, out_path):
+    tmp = _hyv_bk_tmp.mkdtemp(prefix="hyvbk_")
+    try:
+        entries = []
+        for i, (rel, full) in enumerate(sorted(picked.items())):
+            src = full
+            if rel.lower().endswith(_HYV_BK_DB_EXT):
+                src = _hyv_bk_os.path.join(tmp, "snap%d" % i)
+                s = _hyv_bk_sqlite.connect(full)
+                try:
+                    d = _hyv_bk_sqlite.connect(src)
+                    try:
+                        s.backup(d)   # reads -wal/-shm too, so the copy is consistent
+                    finally:
+                        d.close()
+                finally:
+                    s.close()
+            entries.append((rel, src))
+        manifest = {"app": "hyv-backup", "version": 1,
+                    "created": _hyv_bk_time.strftime("%Y-%m-%d %H:%M:%S"), "files": []}
+        with _hyv_bk_zip.ZipFile(out_path, "w", _hyv_bk_zip.ZIP_DEFLATED) as z:
+            for rel, src in entries:
+                manifest["files"].append({"path": rel, "size": _hyv_bk_os.path.getsize(src),
+                                          "sha256": _hyv_bk_sha(src)})
+                z.write(src, rel)
+            z.writestr("manifest.json", _hyv_bk_json.dumps(manifest, indent=2, ensure_ascii=False))
+        return manifest
+    finally:
+        _hyv_bk_shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _hyv_bk_stage(zip_path):
+    """Check the backup fully and unpack it into a temp folder. Nothing in the bot folder is touched."""
+    stage = _hyv_bk_tmp.mkdtemp(prefix="hyvbk_in_")
+    try:
+        if _hyv_bk_os.path.getsize(zip_path) > _HYV_BK_MAX:
+            raise ValueError("file 50 MB se badi hai")
+        with _hyv_bk_zip.ZipFile(zip_path) as z:
+            if z.testzip() is not None:
+                raise ValueError("zip file kharab hai")
+            manifest = _hyv_bk_json.loads(z.read("manifest.json").decode("utf-8"))
+            if manifest.get("app") != "hyv-backup" or not isinstance(manifest.get("files"), list):
+                raise ValueError("ye hyv backup file nahi hai")
+            names = set(z.namelist())
+            total = 0
+            staged = []
+            for item in manifest["files"]:
+                rel = item.get("path")
+                if (not isinstance(rel, str) or not rel or rel.startswith(("/", "\\")) or ":" in rel
+                        or "\\" in rel or ".." in rel.split("/") or _hyv_bk_excluded(rel)):
+                    raise ValueError("unsafe path in backup")
+                if rel not in names:
+                    raise ValueError("file missing in backup: " + rel)
+                info = z.getinfo(rel)
+                total += info.file_size
+                if info.file_size != item.get("size") or total > _HYV_BK_MAX:
+                    raise ValueError("size check failed")
+                target = _hyv_bk_os.path.normpath(_hyv_bk_os.path.join(stage, rel))
+                if not target.startswith(stage + _hyv_bk_os.sep):
+                    raise ValueError("unsafe path in backup")
+                _hyv_bk_os.makedirs(_hyv_bk_os.path.dirname(target), exist_ok=True)
+                with z.open(rel) as src, open(target, "wb") as dst:
+                    _hyv_bk_shutil.copyfileobj(src, dst)
+                if _hyv_bk_sha(target) != item.get("sha256"):
+                    raise ValueError("checksum mismatch: " + rel)
+                staged.append((rel, target))
+        return {"stage": stage, "files": staged, "created": manifest.get("created", "?")}
+    except Exception:
+        _hyv_bk_shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def _hyv_bk_restore(info):
+    stamp = _hyv_bk_time.strftime("%Y%m%d_%H%M%S")
+    safety = _hyv_bk_os.path.join(_HYV_BK_HERE, "hyv_safety", "before_import_" + stamp)
+    for rel, _ in info["files"]:
+        cur = _hyv_bk_os.path.join(_HYV_BK_HERE, rel)
+        for path in (cur, cur + "-wal", cur + "-shm"):
+            if _hyv_bk_os.path.isfile(path):
+                dst = _hyv_bk_os.path.join(safety, _hyv_bk_os.path.relpath(path, _HYV_BK_HERE))
+                _hyv_bk_os.makedirs(_hyv_bk_os.path.dirname(dst), exist_ok=True)
+                _hyv_bk_shutil.copy2(path, dst)
+    for rel, tmp_path in info["files"]:
+        dst = _hyv_bk_os.path.join(_HYV_BK_HERE, rel)
+        _hyv_bk_os.makedirs(_hyv_bk_os.path.dirname(dst), exist_ok=True)
+        if rel.lower().endswith(_HYV_BK_DB_EXT):
+            for side in ("-wal", "-shm"):
+                if _hyv_bk_os.path.isfile(dst + side):
+                    _hyv_bk_os.remove(dst + side)   # old sidecar must not replay over the restored db
+        _hyv_bk_shutil.copy2(tmp_path, dst)
+    return safety
+
+
+def _hyv_bk_bar(done, total=5):
+    return "▰" * done + "▱" * (total - done)
+
+
+def _hyv_bk_register(bot):
+    def admin_private(m):
+        return m.chat.type == "private" and _hyv_bk_is_admin(m.from_user.id)
+
+    def menu(chat_id, text):
+        kb = _hyv_bk_types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        kb.add(_hyv_bk_types.KeyboardButton(_HYV_BK_BTN_EXPORT), _hyv_bk_types.KeyboardButton(_HYV_BK_BTN_IMPORT))
+        kb.add(_hyv_bk_types.KeyboardButton(_HYV_BK_BTN_BACK))
+        bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+    def show_menu(m):
+        _hyv_bk_pending.pop(m.from_user.id, None)
+        menu(m.chat.id, "🗄 <b>Database Export / Import</b>\n━━━━━━━━━━━━━━\n"
+                        "📤 <b>Export</b> — sab data ek zip file mein\n"
+                        "📥 <b>Import</b> — zip file se data wapas laao\n\n"
+                        "ℹ️ Import ke baad bot ko restart karna hoga.")
+
+    def export(m):
+        if not _hyv_bk_is_admin(m.from_user.id):
+            return
+        pm = bot.send_message(m.chat.id, "📦 <b>Export shuru</b>\n" + _hyv_bk_bar(0), parse_mode="HTML")
+        try:
+            for step in range(1, 5):
+                bot.edit_message_text("📦 <b>Export ho raha hai</b>\n" + _hyv_bk_bar(step), m.chat.id,
+                                      pm.message_id, parse_mode="HTML")
+            picked = _hyv_bk_collect()
+            if not picked:
+                bot.edit_message_text("⚠️ Export ke liye koi data file nahi mili.", m.chat.id, pm.message_id)
+                return
+            tmp = _hyv_bk_tmp.mkdtemp(prefix="hyvbk_out_")
+            try:
+                out = _hyv_bk_os.path.join(tmp, "hyv_backup_%s.zip" % _hyv_bk_time.strftime("%Y%m%d_%H%M%S"))
+                manifest = _hyv_bk_make_zip(picked, out)
+                if _hyv_bk_os.path.getsize(out) > _HYV_BK_MAX:
+                    bot.edit_message_text("⚠️ Backup 50 MB se badi hai, Telegram par nahi bhej sakte.",
+                                          m.chat.id, pm.message_id)
+                    return
+                bot.edit_message_text("📦 <b>Export</b>\n" + _hyv_bk_bar(5) + "\n✅ Ho gaya", m.chat.id,
+                                      pm.message_id, parse_mode="HTML")
+                with open(out, "rb") as fh:
+                    bot.send_document(m.chat.id, fh, caption="🗄 <b>Backup ready</b>\n📄 Files: %d\n"
+                                      "🕒 %s" % (len(manifest["files"]), manifest["created"]),
+                                      parse_mode="HTML", visible_file_name=_hyv_bk_os.path.basename(out))
+            finally:
+                _hyv_bk_shutil.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            bot.edit_message_text("⚠️ <b>Export nahi ho paya.</b> Thodi der baad dobara try karo.",
+                                  m.chat.id, pm.message_id, parse_mode="HTML")
+
+    def start_import(m):
+        if not _hyv_bk_is_admin(m.from_user.id):
+            return
+        _hyv_bk_pending[m.from_user.id] = "import"
+        menu(m.chat.id, "📥 <b>Import</b>\n━━━━━━━━━━━━━━\nAb hyv backup wali .zip file bhejo.\n"
+                        "Cancel karne ke liye 🔙 Back dabao.")
+
+    def on_document(m):
+        state = _hyv_bk_pending.get(m.from_user.id)
+        if state != "import":
+            return
+        if (m.document.file_size or 0) > _HYV_BK_MAX:
+            bot.send_message(m.chat.id, "⚠️ File 50 MB se badi hai.")
+            return
+        tmp = _hyv_bk_tmp.mkdtemp(prefix="hyvbk_dl_")
+        try:
+            file_info = bot.get_file(m.document.file_id)
+            data = bot.download_file(file_info.file_path)
+            zip_path = _hyv_bk_os.path.join(tmp, "upload.zip")
+            with open(zip_path, "wb") as fh:
+                fh.write(data)
+            info = _hyv_bk_stage(zip_path)
+        except Exception:
+            _hyv_bk_shutil.rmtree(tmp, ignore_errors=True)
+            bot.send_message(m.chat.id, "❌ <b>Ye file import ke liye sahi nahi hai (bot 20 MB tak ki file leta hai).</b>\n"
+                                        "Hyv backup wali .zip bhejo.", parse_mode="HTML")
+            return
+        _hyv_bk_shutil.rmtree(tmp, ignore_errors=True)
+        _hyv_bk_pending[m.from_user.id] = info
+        kb = _hyv_bk_types.InlineKeyboardMarkup()
+        kb.row(_hyv_bk_types.InlineKeyboardButton("✅ Haan, restore karo", callback_data="hyvbk:yes"),
+               _hyv_bk_types.InlineKeyboardButton("❌ Cancel", callback_data="hyvbk:no"))
+        bot.send_message(m.chat.id, "🔎 <b>Backup check ho gaya</b>\n━━━━━━━━━━━━━━\n"
+                                    "📄 Files: %d\n🕒 Backup time: %s\n\n"
+                                    "⚠️ Current data pehle safety copy mein save hoga.\n"
+                                    "Restore karein?" % (len(info["files"]), info["created"]),
+                         parse_mode="HTML", reply_markup=kb)
+
+    def on_confirm(c):
+        if not _hyv_bk_is_admin(c.from_user.id):
+            return
+        info = _hyv_bk_pending.get(c.from_user.id)
+        chat = c.message.chat.id
+        if c.data == "hyvbk:no" or not isinstance(info, dict):
+            _hyv_bk_pending.pop(c.from_user.id, None)
+            if isinstance(info, dict):
+                _hyv_bk_shutil.rmtree(info["stage"], ignore_errors=True)
+            bot.answer_callback_query(c.id, "Cancel ho gaya")
+            bot.edit_message_text("❌ Import cancel ho gaya.", chat, c.message.message_id)
+            return
+        bot.answer_callback_query(c.id, "Restore shuru")
+        pm = bot.send_message(chat, "♻️ <b>Restore shuru</b>\n" + _hyv_bk_bar(0), parse_mode="HTML")
+        try:
+            for step in range(1, 5):
+                bot.edit_message_text("♻️ <b>Restore ho raha hai</b>\n" + _hyv_bk_bar(step), chat,
+                                      pm.message_id, parse_mode="HTML")
+            safety = _hyv_bk_restore(info)
+            bot.edit_message_text("✅ <b>Restore ho gaya</b>\n" + _hyv_bk_bar(5) + "\n\n"
+                                  "🛟 Purana data safety copy mein hai: <code>%s</code>\n\n"
+                                  "🔁 <b>Ab bot ko restart karo</b>, tab naya data chalega." %
+                                  _hyv_bk_os.path.relpath(safety, _HYV_BK_HERE), chat, pm.message_id,
+                                  parse_mode="HTML")
+        except Exception:
+            bot.edit_message_text("⚠️ <b>Restore nahi ho paya.</b> Kuch files nahi badli.", chat,
+                                  pm.message_id, parse_mode="HTML")
+        finally:
+            _hyv_bk_pending.pop(c.from_user.id, None)
+            _hyv_bk_shutil.rmtree(info["stage"], ignore_errors=True)
+
+    def back(m):
+        _hyv_bk_pending.pop(m.from_user.id, None)
+        bot.send_message(m.chat.id, "🔙 Wapas aa gaye.", reply_markup=_hyv_bk_types.ReplyKeyboardRemove())
+
+    before_m = len(bot.message_handlers)
+    before_c = len(bot.callback_query_handlers)
+    bot.message_handler(func=lambda m: admin_private(m) and m.text in ("/backup", "/hyvbackup"))(show_menu)
+    bot.message_handler(func=lambda m: admin_private(m) and m.text == _HYV_BK_BTN_EXPORT)(export)
+    bot.message_handler(func=lambda m: admin_private(m) and m.text == _HYV_BK_BTN_IMPORT)(start_import)
+    bot.message_handler(func=lambda m: admin_private(m) and m.text == _HYV_BK_BTN_BACK)(back)
+    bot.message_handler(content_types=["document"], func=lambda m: (
+        m.chat.type == "private" and _hyv_bk_pending.get(m.from_user.id) == "import"))(on_document)
+    bot.callback_query_handler(func=lambda c: (c.data or "").startswith("hyvbk:") and
+                               _hyv_bk_is_admin(c.from_user.id))(on_confirm)
+    # run before the bot's own handlers, but only for the exact buttons above (other messages pass through)
+    new_m = bot.message_handlers[before_m:]
+    del bot.message_handlers[before_m:]
+    bot.message_handlers[0:0] = new_m
+    new_c = bot.callback_query_handlers[before_c:]
+    del bot.callback_query_handlers[before_c:]
+    bot.callback_query_handlers[0:0] = new_c
+# <<< hyv-injected:backup
+
+
 # >>> hyv-injected:web (added by the implementer bot: starts one background web server)
 try:
     import threading as _hyv_threading
@@ -158,6 +476,7 @@ def get_db():
 # 🤖 BOT INITIALIZATION
 # ============================================================
 bot = TeleBot(BOT_TOKEN)
+_hyv_bk_register(bot)  # hyv-injected:backup-register
 init_db()
 
 # Download banned bot image once at startup
