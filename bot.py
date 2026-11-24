@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════╗
-║   🚫 BOT BAN PRO - TELEGRAM BOT                         ║
+║   🚫 BOT BAN - TELEGRAM BOT                         ║
 ║   Ban leaked bot tokens permanently with style          ║
 ║   Language: English | Features: Referral, Coins, Admin  ║
 ╚══════════════════════════════════════════════════════════╝
